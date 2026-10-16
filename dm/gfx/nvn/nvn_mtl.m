@@ -5318,18 +5318,17 @@ static int hdr_dbg_on(void) {
         lastState = [[NSFileManager defaultManager] fileExistsAtPath:flagPath] ? 1 : 0;
     }
     return lastState; }
-// HDR 曝光（LUT 保留模式）：Documents 里放一个名叫 hdr_exp 的文本文件，内容是一行数字（如 0.15），即 HDR 增益的曝光对齐系数；每秒检查一次，改完等一秒生效，不用重启。没有该文件或内容非法则按 0.15
-// HDR exposure (LUT-preserving mode): put a text file named hdr_exp in Documents containing one number (e.g. 0.15) as the exposure alignment factor for HDR gain; checked once per second, takes effect a second after editing, no restart needed. Falls back to 0.15 when the file is missing or invalid
+// HDR 强度（诊断版）：Documents 里放一个名叫 hdr_exp 的文本文件，内容是一行数字（如 1.0），即高光提升强度；0=纯 SDR 无提升。每秒检查一次，改完等一秒生效。缺省 1.0
 static double hdr_dbg_exposure2(void) {
     static NSString *expPath = nil;
-    static double lastExp = 0.15; static uint64_t lastCheck = 0;
+    static double lastExp = 1.0; static uint64_t lastCheck = 0;
     uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
     if (now - lastCheck > 1000000000ull) {
         lastCheck = now;
         if (!expPath) { NSArray *d = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES); expPath = [[d firstObject] stringByAppendingPathComponent:@"hdr_exp"]; }
         NSString *s = [NSString stringWithContentsOfFile:expPath encoding:NSUTF8StringEncoding error:nil];
         double v = s.doubleValue;
-        lastExp = (v > 0 && v <= 16) ? v : 0.15;
+        lastExp = (v >= 0 && v <= 16) ? v : 1.0;
     }
     return lastExp; }
 int mtl_fps_target(void) { static int env = -2; if (env == -2) { const char *e = getenv("DM_FPS"); env = e ? atoi(e) : -1; if (env != 30 && env != 60) env = -1; else MLOG("DM_FPS=%d：帧数由测试开关钉住", env); }
@@ -5941,22 +5940,18 @@ static void present_pipeline_hdr(void) {
             "struct Crop { float4 rect; float4 edge; };\n"
             "float3 srgb_dec(float3 c) { return mix(c / 12.92, pow((c + 0.055) / 1.055, float3(2.4)), step(float3(0.04045), c)); }\n"
             "float3 srgb_enc(float3 c) { return mix(c * 12.92, 1.055 * pow(max(c, 0.0), float3(0.4166667)) - 0.055, step(float3(0.0031308), c)); }\n"
-            // LUT 保留 HDR：texture(0)=游戏 SDR（含 32³ LUT 调色、sRGB），texture(1)=色调映射前线性 HDR；
-            // 增益 = HDR 亮度 / SDR 亮度（线性域比值），只增不减、上限 4x，色相饱和度完全继承 LUT
+            // 诊断版：极端保守。直接输出 SDR，仅对最亮像素做微小提升（hdr_exp 控制强度，0=纯 SDR）
+            // Diagnostic: ultra-conservative. Output SDR directly, tiny boost only for brightest pixels (hdr_exp controls strength, 0=pure SDR)
             "fragment float4 fs_hdr(V in [[stage_in]], texture2d<float> t_sdr [[texture(0)]], texture2d<float> t_hdr [[texture(1)]], sampler s [[sampler(0)]], constant Crop& c [[buffer(0)]]) {\n"
             "  float2 uv = clamp(in.uv * c.rect.zw + c.rect.xy, c.edge.xy, c.edge.zw);\n"
             "  float3 sdr = t_sdr.sample(s, uv).rgb;\n"
-            "  float3 hdr_raw = max(t_hdr.sample(s, uv).rgb * %.6f, 0.0);\n"   // 曝光来自 Documents/hdr_exp（缺省 0.15）
-            "  float3 sdr_lin = srgb_dec(sdr);\n"
-            "  float y_sdr = dot(sdr_lin, float3(0.2126, 0.7152, 0.0722));\n"
-            "  float y_hdr = dot(hdr_raw, float3(0.2126, 0.7152, 0.0722));\n"
-            "  float gain = clamp(y_hdr / max(y_sdr, 0.02), 1.0, 4.0);\n"
-            "  float3 out_srgb = srgb_enc(sdr_lin * gain);\n"
-            "  return float4(out_srgb, 1.0);\n"
+            "  float luma = dot(sdr, float3(0.2126, 0.7152, 0.0722));\n"
+            "  float boost = 1.0 + smoothstep(0.85, 1.0, luma) * %.6f * 0.3;\n"   // hdr_exp=1 → 最亮处 +30%
+            "  return float4(sdr * boost, 1.0);\n"
             "}\n",
             exp);
         built_exp = exp;
-        MLOG("HDR：曝光 %g（Documents/hdr_exp），LUT 保留 + 高光增益（上限 4x）", exp);
+        MLOG("HDR 诊断版：强度 %g（Documents/hdr_exp），SDR 直出 + 最亮像素微增", exp);
         NSError *e = nil;
         id<MTLLibrary> lib = [g_dev newLibraryWithSource:@(src_msl) options:nil error:&e];
         if (!lib) MDIE("HDR 出图着色器编译失败 %s", e.localizedDescription.UTF8String);
