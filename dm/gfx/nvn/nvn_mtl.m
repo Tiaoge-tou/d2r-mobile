@@ -5311,6 +5311,20 @@ static int hdr_dbg_on(void) {
         lastState = [[NSFileManager defaultManager] fileExistsAtPath:flagPath] ? 1 : 0;
     }
     return lastState; }
+// HDR 曝光（vertical slice 调试）：Documents 里放一个名叫 hdr_exp 的文本文件，内容是一行数字（如 0.25），即曝光倍数；每秒检查一次，改完等一秒生效，不用重启。没有该文件或内容非法则按 1.0
+// HDR exposure (vertical slice debug): put a text file named hdr_exp in Documents containing one number (e.g. 0.25) as the exposure multiplier; checked once per second, takes effect a second after editing, no restart needed. Falls back to 1.0 when the file is missing or invalid
+static double hdr_dbg_exposure(void) {
+    static NSString *expPath = nil;
+    static double lastExp = 1.0; static uint64_t lastCheck = 0;
+    uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    if (now - lastCheck > 1000000000ull) {
+        lastCheck = now;
+        if (!expPath) { NSArray *d = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES); expPath = [[d firstObject] stringByAppendingPathComponent:@"hdr_exp"]; }
+        NSString *s = [NSString stringWithContentsOfFile:expPath encoding:NSUTF8StringEncoding error:nil];
+        double v = s.doubleValue;
+        lastExp = (v > 0 && v <= 16) ? v : 1.0;
+    }
+    return lastExp; }
 int mtl_fps_target(void) { static int env = -2; if (env == -2) { const char *e = getenv("DM_FPS"); env = e ? atoi(e) : -1; if (env != 30 && env != 60) env = -1; else MLOG("DM_FPS=%d：帧数由测试开关钉住", env); }
     return env > 0 ? env : dm_fps_setting() == 30 ? 30 : 60; }
 // 外推启用状态一变（省电模式切换、世界冻结接手 / 交回）：先让「跨帧不写回」账本重学（试用期里照常写回），外推晚一帧再真正切换——
@@ -5908,18 +5922,24 @@ static void present_pipeline(MTLPixelFormat format) {
 // HDR 调试出图管线：采样 RG11B10Float 线性 HDR，linear→sRGB EOTF（扩展范围，>1 保留给 EDR 层显示）；绑定布局与普通出图一致，可复用同一套 argument table
 // HDR debug present pipeline: samples RG11B10Float linear HDR, applies the linear→sRGB EOTF (extended range; values above 1.0 are preserved for the EDR layer); bindings match the normal present path so the same argument table can be reused
 static void present_pipeline_hdr(void) {
-    if (!g_blit_pso_hdr) {
-        static const char *src_msl =
+    double exp = hdr_dbg_exposure();
+    static double built_exp = -1;
+    if (!g_blit_pso_hdr || exp != built_exp) {
+        char src_msl[2048];
+        snprintf(src_msl, sizeof src_msl,
             "#include <metal_stdlib>\nusing namespace metal;\n"
             "struct V { float4 p [[position]]; float2 uv; };\n"
             "vertex V vs_hdr(uint id [[vertex_id]]) { float2 uv = float2((id << 1) & 2, id & 2); V o; o.p = float4(uv * float2(2, -2) + float2(-1, 1), 0, 1); o.uv = uv; return o; }\n"
             "struct Crop { float4 rect; float4 edge; };\n"
             "fragment float4 fs_hdr(V in [[stage_in]], texture2d<float> t [[texture(0)]], sampler s [[sampler(0)]], constant Crop& c [[buffer(0)]]) {\n"
             "  float3 hdr = t.sample(s, clamp(in.uv * c.rect.zw + c.rect.xy, c.edge.xy, c.edge.zw)).rgb;\n"
-            "  hdr = max(hdr, 0.0) * 1.0;\n"   // 曝光（调试先 1.0；真机看效果后再调，游戏色调映射里是 HDR×0.008 再 PQ，可作参考）
+            "  hdr = max(hdr, 0.0) * %.6f;\n"   // 曝光来自 Documents/hdr_exp（无文件则 1.0）；旧管线故意不释放——在途的帧可能还在引用它
             "  float3 srgb = mix(hdr * 12.92, 1.055 * pow(hdr, float3(0.4166667)) - 0.055, step(float3(0.0031308), hdr));\n"
             "  return float4(srgb, 1.0);\n"
-            "}\n";
+            "}\n",
+            exp);
+        built_exp = exp;
+        if (exp != 1.0) MLOG("HDR 调试：曝光 %g（Documents/hdr_exp）", exp);
         NSError *e = nil;
         id<MTLLibrary> lib = [g_dev newLibraryWithSource:@(src_msl) options:nil error:&e];
         if (!lib) MDIE("HDR 出图着色器编译失败 %s", e.localizedDescription.UTF8String);
