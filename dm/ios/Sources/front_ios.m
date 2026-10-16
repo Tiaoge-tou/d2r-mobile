@@ -897,12 +897,13 @@ UIView *front_ios_view(CGRect frame) {
     [g_rate_link addToRunLoop:NSRunLoop.mainRunLoop forMode:NSRunLoopCommonModes];
     g_layer = (CAMetalLayer *)v.layer;
     g_layer.device = MTLCreateSystemDefaultDevice();
-    g_layer.pixelFormat = MTLPixelFormatBGRA8Unorm;
+    g_layer.pixelFormat = MTLPixelFormatRGBA16Float;
+    g_layer.wantsExtendedDynamicRangeContent = YES;   // HDR 出图：16F + EDR；SDR 内容（0-1）显示不变
     g_layer.contentsScale = UIScreen.mainScreen.nativeScale;
     g_layer.drawableSize = CGSizeMake(frame.size.width * g_layer.contentsScale, frame.size.height * g_layer.contentsScale);
     if (!CGRectEqualToRect(full, frame)) { DmLetterboxView *box = [[DmLetterboxView alloc] initWithFrame:full]; box.backgroundColor = UIColor.blackColor; box.game = v; [box addSubview:v];
         if (g_full) {   // 出图层与游戏视图分离：出图层挂在容器上铺满整窗，游戏视图透明、叠在它上面 | The present layer is separated from the game view: the present layer hangs on the container and fills the whole window; the game view is transparent and stacked on top of it
-            CAMetalLayer *ml = [CAMetalLayer layer]; ml.device = g_layer.device; ml.pixelFormat = MTLPixelFormatBGRA8Unorm; ml.contentsScale = g_layer.contentsScale; ml.frame = box.bounds;
+            CAMetalLayer *ml = [CAMetalLayer layer]; ml.device = g_layer.device; ml.pixelFormat = MTLPixelFormatRGBA16Float; ml.wantsExtendedDynamicRangeContent = YES; ml.contentsScale = g_layer.contentsScale; ml.frame = box.bounds;
             ml.drawableSize = CGSizeMake(full.size.width * ml.contentsScale, full.size.height * ml.contentsScale); [box.layer insertSublayer:ml atIndex:0];
             v.opaque = NO; v.layer.opaque = NO; v.backgroundColor = UIColor.clearColor; g_layer = ml; mtl_set_ui_rect_fn(ui_rect_frac);
             LOG("画面：窗口 %.0fx%.0f 比 16:9 窄 → 真全屏已开：出图层铺满整窗；游戏视图跟宿主的界面矩形走（局内贴底、局外居中），启动先按居中的 %.0fx%.0f 摆", full.size.width, full.size.height, frame.size.width, frame.size.height); return box; }
@@ -1545,7 +1546,7 @@ uint64_t front_blank_presents(void) { return g_blank_n; }
 + (Class)layerClass { return CAMetalLayer.class; }
 - (instancetype)initWithFrame:(CGRect)fr {
     if ((self = [super initWithFrame:fr])) {
-        CAMetalLayer *l = (CAMetalLayer *)self.layer; l.device = MTLCreateSystemDefaultDevice(); l.pixelFormat = MTLPixelFormatBGRA8Unorm; l.contentsScale = UIScreen.mainScreen.nativeScale;
+        CAMetalLayer *l = (CAMetalLayer *)self.layer; l.device = MTLCreateSystemDefaultDevice(); l.pixelFormat = MTLPixelFormatRGBA16Float; l.wantsExtendedDynamicRangeContent = YES; l.contentsScale = UIScreen.mainScreen.nativeScale;
         _q = [l.device newCommandQueue];
         _dl = [CADisplayLink displayLinkWithTarget:self selector:@selector(tick)]; _dl.preferredFrameRateRange = CAFrameRateRangeMake(60, 60, 60);
         [_dl addToRunLoop:NSRunLoop.mainRunLoop forMode:NSRunLoopCommonModes];
