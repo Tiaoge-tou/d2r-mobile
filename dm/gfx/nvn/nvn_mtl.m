@@ -104,6 +104,7 @@ static id<MTL4CommandAllocator> g_present_alloc4[3];
 static CBUF g_present_cb[3];
 static id<MTL4ArgumentTable> g_vt, g_ft, g_ct, g_up_ct;
 static id<MTL4ArgumentTable> g_present_args;
+static id<MTL4ArgumentTable> g_present_args_hdr2;  // HDR2（LUT 保留）：双贴图 argument table
 #endif
 static id<MTLBuffer> g_present_uv[3];
 int g_bloom_q = -1;   // 泛光 1/4 起点（非 static：真机同进程交替直接改 0 / 1） | Bloom 1/4 starting point (non-static: real-device same-process alternation sets it to 0 / 1 directly)
@@ -381,6 +382,12 @@ void mtl_init(void) {
     pad.maxTextureBindCount = 1; pad.maxSamplerStateBindCount = 1; pad.maxBufferBindCount = 1;
     g_present_args = [g_dev newArgumentTableWithDescriptor:pad error:&ate];
     if (!g_present_args) MDIE("建立出图 argument table 失败：%s", ate.localizedDescription.UTF8String);
+    {   // HDR2 双贴图：texture(0)=游戏 SDR，texture(1)=HDR 线性捕获
+        MTL4ArgumentTableDescriptor *pad2 = [MTL4ArgumentTableDescriptor new];
+        pad2.maxTextureBindCount = 2; pad2.maxSamplerStateBindCount = 1; pad2.maxBufferBindCount = 1;
+        g_present_args_hdr2 = [g_dev newArgumentTableWithDescriptor:pad2 error:&ate];
+        if (!g_present_args_hdr2) MDIE("建立 HDR 出图 argument table 失败：%s", ate.localizedDescription.UTF8String);
+    }
     g_bloomq_args = [g_dev newArgumentTableWithDescriptor:pad error:&ate];
     if (!g_bloomq_args) MDIE("建立泛光 1/4 argument table 失败：%s", ate.localizedDescription.UTF8String);
 #endif
@@ -5311,18 +5318,18 @@ static int hdr_dbg_on(void) {
         lastState = [[NSFileManager defaultManager] fileExistsAtPath:flagPath] ? 1 : 0;
     }
     return lastState; }
-// HDR 曝光（vertical slice 调试）：Documents 里放一个名叫 hdr_exp 的文本文件，内容是一行数字（如 0.25），即曝光倍数；每秒检查一次，改完等一秒生效，不用重启。没有该文件或内容非法则按 1.0
-// HDR exposure (vertical slice debug): put a text file named hdr_exp in Documents containing one number (e.g. 0.25) as the exposure multiplier; checked once per second, takes effect a second after editing, no restart needed. Falls back to 1.0 when the file is missing or invalid
-static double hdr_dbg_exposure(void) {
+// HDR 曝光（LUT 保留模式）：Documents 里放一个名叫 hdr_exp 的文本文件，内容是一行数字（如 0.15），即 HDR 增益的曝光对齐系数；每秒检查一次，改完等一秒生效，不用重启。没有该文件或内容非法则按 0.15
+// HDR exposure (LUT-preserving mode): put a text file named hdr_exp in Documents containing one number (e.g. 0.15) as the exposure alignment factor for HDR gain; checked once per second, takes effect a second after editing, no restart needed. Falls back to 0.15 when the file is missing or invalid
+static double hdr_dbg_exposure2(void) {
     static NSString *expPath = nil;
-    static double lastExp = 1.0; static uint64_t lastCheck = 0;
+    static double lastExp = 0.15; static uint64_t lastCheck = 0;
     uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
     if (now - lastCheck > 1000000000ull) {
         lastCheck = now;
         if (!expPath) { NSArray *d = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES); expPath = [[d firstObject] stringByAppendingPathComponent:@"hdr_exp"]; }
         NSString *s = [NSString stringWithContentsOfFile:expPath encoding:NSUTF8StringEncoding error:nil];
         double v = s.doubleValue;
-        lastExp = (v > 0 && v <= 16) ? v : 1.0;
+        lastExp = (v > 0 && v <= 16) ? v : 0.15;
     }
     return lastExp; }
 int mtl_fps_target(void) { static int env = -2; if (env == -2) { const char *e = getenv("DM_FPS"); env = e ? atoi(e) : -1; if (env != 30 && env != 60) env = -1; else MLOG("DM_FPS=%d：帧数由测试开关钉住", env); }
@@ -5368,6 +5375,7 @@ static void rt_frame_begin(void) { g_rt.filt = g_rt.ui_seen = g_rt.main_seen = g
     if (g_frz_state == 0) { g_rt.have_prev = g_rt.have_ldr = 0; for (int i = 0; i < g_rt.nsh; i++) g_rt.sh[i].skin = g_rt.sh[i].other = 0; } }   // 全画帧：本帧拷成了才许下一帧外推 | Fully drawn frame: the next frame may extrapolate only if this frame's copies succeeded
 // ---------- HDR 调试（vertical slice）：色调映射执行前拷下 HDR，出图时直接显示它 ----------
 static id<MTLTexture> g_hdr_dbg_tex;     // 色调映射前拷下的 468（RG11B10Float HDR）
+static id<MTLTexture> g_hdr_tex_bind;    // HDR2 出图时绑到 texture(1) 的 HDR 贴图（present_encode_hdr 置）
 static int g_blit_hdr;                   // 本次出图是否走 HDR 调试 shader（present_now 按开关置）
 static id<MTLRenderPipelineState> g_blit_pso_hdr;   // HDR 调试出图管线
 static void rt_set_rt(const p_set_rt *r, int win) {   // 每条设目标（全画帧与外推帧都走）：认角色、全画帧找拷贝点、外推帧定本通道是否只留蒙皮 | Every set-target (both fully drawn and extrapolated frames go through here): identify roles, find the copy points in fully drawn frames, and in extrapolated frames decide whether this render pass keeps only skinned draws
@@ -5922,24 +5930,33 @@ static void present_pipeline(MTLPixelFormat format) {
 // HDR 调试出图管线：采样 RG11B10Float 线性 HDR，linear→sRGB EOTF（扩展范围，>1 保留给 EDR 层显示）；绑定布局与普通出图一致，可复用同一套 argument table
 // HDR debug present pipeline: samples RG11B10Float linear HDR, applies the linear→sRGB EOTF (extended range; values above 1.0 are preserved for the EDR layer); bindings match the normal present path so the same argument table can be reused
 static void present_pipeline_hdr(void) {
-    double exp = hdr_dbg_exposure();
+    double exp = hdr_dbg_exposure2();
     static double built_exp = -1;
     if (!g_blit_pso_hdr || exp != built_exp) {
-        char src_msl[2048];
+        char src_msl[4096];
         snprintf(src_msl, sizeof src_msl,
             "#include <metal_stdlib>\nusing namespace metal;\n"
             "struct V { float4 p [[position]]; float2 uv; };\n"
             "vertex V vs_hdr(uint id [[vertex_id]]) { float2 uv = float2((id << 1) & 2, id & 2); V o; o.p = float4(uv * float2(2, -2) + float2(-1, 1), 0, 1); o.uv = uv; return o; }\n"
             "struct Crop { float4 rect; float4 edge; };\n"
-            "fragment float4 fs_hdr(V in [[stage_in]], texture2d<float> t [[texture(0)]], sampler s [[sampler(0)]], constant Crop& c [[buffer(0)]]) {\n"
-            "  float3 hdr = t.sample(s, clamp(in.uv * c.rect.zw + c.rect.xy, c.edge.xy, c.edge.zw)).rgb;\n"
-            "  hdr = max(hdr, 0.0) * %.6f;\n"   // 曝光来自 Documents/hdr_exp（无文件则 1.0）；旧管线故意不释放——在途的帧可能还在引用它
-            "  float3 srgb = mix(hdr * 12.92, 1.055 * pow(hdr, float3(0.4166667)) - 0.055, step(float3(0.0031308), hdr));\n"
-            "  return float4(srgb, 1.0);\n"
+            "float3 srgb_dec(float3 c) { return mix(c / 12.92, pow((c + 0.055) / 1.055, float3(2.4)), step(float3(0.04045), c)); }\n"
+            "float3 srgb_enc(float3 c) { return mix(c * 12.92, 1.055 * pow(max(c, 0.0), float3(0.4166667)) - 0.055, step(float3(0.0031308), c)); }\n"
+            // LUT 保留 HDR：texture(0)=游戏 SDR（含 32³ LUT 调色、sRGB），texture(1)=色调映射前线性 HDR；
+            // 增益 = HDR 亮度 / SDR 亮度（线性域比值），只增不减、上限 4x，色相饱和度完全继承 LUT
+            "fragment float4 fs_hdr(V in [[stage_in]], texture2d<float> t_sdr [[texture(0)]], texture2d<float> t_hdr [[texture(1)]], sampler s [[sampler(0)]], constant Crop& c [[buffer(0)]]) {\n"
+            "  float2 uv = clamp(in.uv * c.rect.zw + c.rect.xy, c.edge.xy, c.edge.zw);\n"
+            "  float3 sdr = t_sdr.sample(s, uv).rgb;\n"
+            "  float3 hdr_raw = max(t_hdr.sample(s, uv).rgb * %.6f, 0.0);\n"   // 曝光来自 Documents/hdr_exp（缺省 0.15）
+            "  float3 sdr_lin = srgb_dec(sdr);\n"
+            "  float y_sdr = dot(sdr_lin, float3(0.2126, 0.7152, 0.0722));\n"
+            "  float y_hdr = dot(hdr_raw, float3(0.2126, 0.7152, 0.0722));\n"
+            "  float gain = clamp(y_hdr / max(y_sdr, 0.02), 1.0, 4.0);\n"
+            "  float3 out_srgb = srgb_enc(sdr_lin * gain);\n"
+            "  return float4(out_srgb, 1.0);\n"
             "}\n",
             exp);
         built_exp = exp;
-        if (exp != 1.0) MLOG("HDR 调试：曝光 %g（Documents/hdr_exp）", exp);
+        MLOG("HDR：曝光 %g（Documents/hdr_exp），LUT 保留 + 高光增益（上限 4x）", exp);
         NSError *e = nil;
         id<MTLLibrary> lib = [g_dev newLibraryWithSource:@(src_msl) options:nil error:&e];
         if (!lib) MDIE("HDR 出图着色器编译失败 %s", e.localizedDescription.UTF8String);
@@ -6038,11 +6055,14 @@ static int present_encode_m4(CBUF cb, id<MTLTexture> src0, id<MTLTexture> dst, c
 #if DM_NVN_M3
     [en setFragmentTexture:src atIndex:0];
     [en setFragmentSamplerState:g_blit_samp atIndex:0];
+    if (g_blit_hdr && g_hdr_tex_bind) [en setFragmentTexture:g_hdr_tex_bind atIndex:1];  // HDR2：texture(1)=线性 HDR
 #else
     [en barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageAll visibilityOptions:MTL4VisibilityOptionDevice];
-    [en setArgumentTable:g_present_args atStages:MTLRenderStageFragment];
-    [g_present_args setTexture:src.gpuResourceID atIndex:0];
-    [g_present_args setSamplerState:g_blit_samp.gpuResourceID atIndex:0];
+    id<MTL4ArgumentTable> pat = (g_blit_hdr && g_hdr_tex_bind) ? g_present_args_hdr2 : g_present_args;
+    [en setArgumentTable:pat atStages:MTLRenderStageFragment];
+    [pat setTexture:src.gpuResourceID atIndex:0];
+    if (g_blit_hdr && g_hdr_tex_bind) [pat setTexture:g_hdr_tex_bind.gpuResourceID atIndex:1];
+    [pat setSamplerState:g_blit_samp.gpuResourceID atIndex:0];
 #endif
     float *uv = g_present_uv[uv_i].contents;
     uv[0] = (float)cx / src.width; uv[1] = (float)cy / src.height; uv[2] = (float)cw / src.width; uv[3] = (float)ch / src.height;
@@ -6050,19 +6070,22 @@ static int present_encode_m4(CBUF cb, id<MTLTexture> src0, id<MTLTexture> dst, c
 #if DM_NVN_M3
     [en setFragmentBuffer:g_present_uv[uv_i] offset:0 atIndex:0];
 #else
-    [g_present_args setAddress:g_present_uv[uv_i].gpuAddress atIndex:0];
+    id<MTL4ArgumentTable> pat2 = (g_blit_hdr && g_hdr_tex_bind) ? g_present_args_hdr2 : g_present_args;
+    [pat2 setAddress:g_present_uv[uv_i].gpuAddress atIndex:0];
 #endif
     [en setViewport:vp]; [en setRenderPipelineState:g_blit_hdr ? g_blit_pso_hdr : g_blit_pso];
     [en drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
     m4_end(en);
     return 1;
 }
-// HDR 调试出图：把 g_blit_hdr 置起后走 present_encode_m4（它会选用 HDR 管线），用完复位；调用方保证 hdrtex 非空
-// HDR debug present: raises g_blit_hdr so present_encode_m4 picks the HDR pipeline, then resets it; the caller guarantees hdrtex is non-null
-static int present_encode_hdr(CBUF cb, id<MTLTexture> hdrtex, id<MTLTexture> dst, const int crop[4], int uv_i) {
+// HDR 出图（LUT 保留）：把 g_blit_hdr 置起后走 present_encode_m4（它会选用 HDR 管线并绑双贴图），用完复位；调用方保证 sdrtex/hdrtex 非空
+// HDR present (LUT-preserving): raises g_blit_hdr so present_encode_m4 picks the HDR pipeline and binds both textures, then resets it; the caller guarantees sdrtex/hdrtex are non-null
+static int present_encode_hdr(CBUF cb, id<MTLTexture> sdrtex, id<MTLTexture> hdrtex, id<MTLTexture> dst, const int crop[4], int uv_i) {
     g_blit_hdr = 1;
-    int r = present_encode_m4(cb, hdrtex, dst, crop, uv_i);
+    g_hdr_tex_bind = hdrtex;
+    int r = present_encode_m4(cb, sdrtex, dst, crop, uv_i);
     g_blit_hdr = 0;
+    g_hdr_tex_bind = nil;
     return r;
 }
 static double g_link_it_tin;   // 节拍回调正在上屏的那一帧的入队时刻（只在节拍线程读写） | Enqueue time of the frame the display-link callback is presenting (read and written only on the display-link thread)
@@ -6138,19 +6161,18 @@ static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t t
         while (g_pq_done < g_present_alloc_fence[alloc_i]) pthread_cond_wait(&g_pq_cv, &g_pq_mu);
         pthread_mutex_unlock(&g_pq_mu);
     }
-    // HDR 调试：Documents 里有 hdr_dbg 文件且本帧拷到了色调映射前的 HDR 缓冲 → 出图直接显示 HDR（跳过游戏的 SDR 管线：色调映射/FXAA/锐化/UI 都不显示，只为验证 HDR 链路）
-    // HDR debug: when hdr_dbg is on in the Custom page and this frame's pre-tonemap HDR buffer was captured → present the HDR directly (bypassing the game's SDR pipeline: no tone mapping / FXAA / sharpen / UI, purely to verify the HDR path)
+    // HDR：Documents 里有 hdr_dbg 文件且本帧拷到了色调映射前的 HDR 缓冲 → LUT 保留的 HDR 出图（游戏 SDR 管线照跑：色调映射/LUT/FXAA/UI 都在，只把高光推进 EDR）
+    // HDR: when hdr_dbg is on in Documents and this frame's pre-tonemap HDR buffer was captured → LUT-preserving HDR present (the game's SDR pipeline runs normally: tone mapping / LUT / FXAA / UI all present, only highlights are pushed into EDR)
     int hdr_dbg = hdr_dbg_on() && g_hdr_dbg_tex != nil;
-    id<MTLTexture> psrc = hdr_dbg ? g_hdr_dbg_tex : src;
 #if DM_NVN_M3
     CBUF cb = [g_q commandBuffer];   // 老接口：交画面记在命令缓冲上（presentDrawable），这一帧的绘制做完才上屏 | older API: presentation is recorded on the command buffer (presentDrawable), so the frame reaches the screen only after its drawing is done
-    if (!(hdr_dbg ? present_encode_hdr(cb, psrc, dr.texture, crop, alloc_i) : present_encode_m4(cb, psrc, dr.texture, crop, alloc_i))) return 0;
+    if (!(hdr_dbg ? present_encode_hdr(cb, src, g_hdr_dbg_tex, dr.texture, crop, alloc_i) : present_encode_m4(cb, src, dr.texture, crop, alloc_i))) return 0;
 #else
     [g_present_alloc4[alloc_i] reset];
     [g_q4 waitForDrawable:dr];
     CBUF cb = g_present_cb[alloc_i];
     [cb beginCommandBufferWithAllocator:g_present_alloc4[alloc_i]];
-    if (!(hdr_dbg ? present_encode_hdr(cb, psrc, dr.texture, crop, alloc_i) : present_encode_m4(cb, psrc, dr.texture, crop, alloc_i))) { [cb endCommandBuffer]; [g_q4 signalDrawable:dr]; return 0; }
+    if (!(hdr_dbg ? present_encode_hdr(cb, src, g_hdr_dbg_tex, dr.texture, crop, alloc_i) : present_encode_m4(cb, src, dr.texture, crop, alloc_i))) { [cb endCommandBuffer]; [g_q4 signalDrawable:dr]; return 0; }
     [cb endCommandBuffer];
 #endif
 #if !DM_NVN_M3
