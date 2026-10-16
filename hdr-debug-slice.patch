@@ -1,16 +1,27 @@
 diff --git a/dm/gfx/nvn/nvn_mtl.m b/dm/gfx/nvn/nvn_mtl.m
-index a532be8..1281e2d 100644
+index a532be8..932871d 100644
 --- a/dm/gfx/nvn/nvn_mtl.m
 +++ b/dm/gfx/nvn/nvn_mtl.m
-@@ -5299,6 +5299,7 @@ void mtl_host_apply(uint64_t v) { int frz = (int)(uint32_t)v - 1, force = (int)(
+@@ -5299,6 +5299,18 @@ void mtl_host_apply(uint64_t v) { int frz = (int)(uint32_t)v - 1, force = (int)(
  // Game logic already runs at 25 ticks / second and unit positions are interpolated by time, so there are no repeated frames at 30 frames (measured on a real device: coefficient of variation of per-frame camera displacement 0.292 at 30 frames, 0.296 at 60 frames).
  // The switch is on the 「自定义」(Custom) page (dm_custom.c eco_fps, off by default, takes effect on apply); the test switch DM_FPS=30/60 pins it.
  __attribute__((weak)) int dm_fps_setting(void) { return 60; }   // 宿主 dm_custom.c 提供强定义；图形单测不链宿主时恒 60 | The host's dm_custom.c provides the strong definition; always 60 when graphics unit tests do not link the host
-+__attribute__((weak)) int dm_hdr_dbg(void) { return 0; }   // 宿主 dm_custom.c 提供强定义（读 hdr_dbg 键）；图形单测不链宿主时恒关 | The host's dm_custom.c provides the strong definition (reads the hdr_dbg key); always off when graphics unit tests do not link the host
++// HDR 调试开关（vertical slice）：Documents 里放一个名叫 hdr_dbg 的空文件即开，删掉即关；每秒检查一次，不用重启 App
++// HDR debug switch (vertical slice): create an empty file named hdr_dbg in Documents to turn on, delete it to turn off; checked once per second, no app restart needed
++static int hdr_dbg_on(void) {
++    static NSString *flagPath = nil;
++    static int lastState = -1; static uint64_t lastCheck = 0;
++    uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
++    if (lastState < 0 || now - lastCheck > 1000000000ull) {
++        lastCheck = now;
++        if (!flagPath) { NSArray *d = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES); flagPath = [[d firstObject] stringByAppendingPathComponent:@"hdr_dbg"]; }
++        lastState = [[NSFileManager defaultManager] fileExistsAtPath:flagPath] ? 1 : 0;
++    }
++    return lastState; }
  int mtl_fps_target(void) { static int env = -2; if (env == -2) { const char *e = getenv("DM_FPS"); env = e ? atoi(e) : -1; if (env != 30 && env != 60) env = -1; else MLOG("DM_FPS=%d：帧数由测试开关钉住", env); }
      return env > 0 ? env : dm_fps_setting() == 30 ? 30 : 60; }
  // 外推启用状态一变（省电模式切换、世界冻结接手 / 交回）：先让「跨帧不写回」账本重学（试用期里照常写回），外推晚一帧再真正切换——
-@@ -5340,6 +5341,10 @@ static void rt_copy_prev(void) {   // 全画帧：不透明 HDR 与主深度模
+@@ -5340,6 +5352,10 @@ static void rt_copy_prev(void) {   // 全画帧：不透明 HDR 与主深度模
  static void rt_frame_begin(void) { g_rt.filt = g_rt.ui_seen = g_rt.main_seen = g_rt.copied = g_rt.ex_done = g_rt.mainp_seen = 0; g_rt.cur_sh = -1;
      g_rt.oit_seen = g_rt.tm_seen = g_rt.fx_state = g_rt.comp_seen = g_rt.skipall = g_rt.cam_checked = 0; g_rt_ovr = 0; g_dss_dirty = 1;
      if (g_frz_state == 0) { g_rt.have_prev = g_rt.have_ldr = 0; for (int i = 0; i < g_rt.nsh; i++) g_rt.sh[i].skin = g_rt.sh[i].other = 0; } }   // 全画帧：本帧拷成了才许下一帧外推 | Fully drawn frame: the next frame may extrapolate only if this frame's copies succeeded
@@ -21,19 +32,19 @@ index a532be8..1281e2d 100644
  static void rt_set_rt(const p_set_rt *r, int win) {   // 每条设目标（全画帧与外推帧都走）：认角色、全画帧找拷贝点、外推帧定本通道是否只留蒙皮 | Every set-target (both fully drawn and extrapolated frames go through here): identify roles, find the copy points in fully drawn frames, and in extrapolated frames decide whether this render pass keeps only skinned draws
      g_rt.cur_sh = -1; g_rt.shadow = 0; g_rt.first = 1; g_rt.hdrp = 0;
      if (win) { if (g_frz_state == 0) { rt_copy_prev(); if (g_rt.fx_state == 2 && g_rt.ldr) { g_rt.pl469 = rt_cp(g_rt.ldr, g_rt.pl469); g_rt.have_ldr = g_rt.pl469 != nil; g_rt.fx_state = 3; } }
-@@ -5351,7 +5356,10 @@ static void rt_set_rt(const p_set_rt *r, int win) {   // 每条设目标（全
+@@ -5351,7 +5367,10 @@ static void rt_set_rt(const p_set_rt *r, int win) {   // 每条设目标（全
              { static uint64_t lh, ld; if (lh != r->color[0]->serial || ld != r->depth->serial) { lh = r->color[0]->serial; ld = r->depth->serial; MLOG("运行时外推：认出主通道 不透明 HDR 序号 %llu %lux%lu、主深度模板序号 %llu %lux%lu（通道 %llu）", (unsigned long long)lh, (unsigned long)c0.width, (unsigned long)c0.height, (unsigned long long)ld, (unsigned long)dt.width, (unsigned long)dt.height, g_stat_pass + 1); } }
              g_rt.main_seen = 1; g_rt.hdr_ser = r->color[0]->serial; g_rt.ds_ser = r->depth->serial; g_rt.hdr = c0; g_rt.ds = dt; }
          else if (g_rt.main_seen && hdr_here && !g_rt.copied) rt_copy_prev();   // 主通道之后再挂不透明 HDR 的第一个设目标（半透明那趟，468 占 0 号槽但不写）：之前拷 HDR 与主深度模板 | The first set-target after the main pass that attaches the opaque HDR again (the translucent pass; 468 occupies slot 0 but is not written): before it, copy the HDR and the main depth-stencil
 -        else if (g_rt.main_seen && hdr_here && r->n == 1 && r->depth && r->depth->serial == g_rt.ds_ser) g_rt.fx_state = 1;   // 只挂 468 + 主深度 = 色调映射（把 468 挪作 LDR 输出） | Only 468 + main depth attached = tone mapping (repurposes 468 as the LDR output)
 +        else if (g_rt.main_seen && hdr_here && r->n == 1 && r->depth && r->depth->serial == g_rt.ds_ser) {
 +            // 只挂 468 + 主深度 = 色调映射（把 468 挪作 LDR 输出）；执行前 468 仍是 HDR，调试开时拷一份 | Only 468 + main depth attached = tone mapping (repurposes 468 as the LDR output); 468 still holds HDR before it runs, so copy it when HDR debug is on
-+            if (dm_hdr_dbg() && c0) g_hdr_dbg_tex = rt_cp(c0, g_hdr_dbg_tex);
++            if (hdr_dbg_on() && c0) g_hdr_dbg_tex = rt_cp(c0, g_hdr_dbg_tex);
 +            g_rt.fx_state = 1; }
          else if (g_rt.fx_state == 1) {   // 色调映射之后第一个通道 = FXAA（读 468、写 469）：之前拷色调映射后的 468（LDR），记下 469 | The first render pass after tone mapping = FXAA (reads 468, writes 469): before it, copy the post-tone-mapping 468 (LDR) and note down 469
              if (r->n >= 1 && r->color[0] && c0) { g_rt.ldr_ser = r->color[0]->serial; g_rt.ldr = c0; g_rt.pl468 = rt_cp(g_rt.hdr, g_rt.pl468); g_rt.fx_state = 2; } else g_rt.fx_state = 0; }
          else if (g_rt.fx_state == 2 && g_rt.ldr) { g_rt.pl469 = rt_cp(g_rt.ldr, g_rt.pl469); g_rt.have_ldr = g_rt.pl468 && g_rt.pl469; g_rt.fx_state = 3; }   // FXAA 之后第一个通道之前：拷 FXAA 后的 469 | Before the first render pass after FXAA: copy the post-FXAA 469
-@@ -5886,6 +5894,31 @@ static void present_pipeline(MTLPixelFormat format) {
+@@ -5886,6 +5905,31 @@ static void present_pipeline(MTLPixelFormat format) {
          g_blit_samp = [g_dev newSamplerStateWithDescriptor:sd];
      }
  }
@@ -65,7 +76,7 @@ index a532be8..1281e2d 100644
  // 呈现采样的源：交换链贴图是 sRGB 格式（游戏把交换链建成 RGBA8_SRGB）时经它的非 sRGB 视图采样，屏上显示存的字节，与 Switch 扫描输出一致；
  // 直接采样会先解成线性，呈现层（BGRA8Unorm）不再编码，整幅偏暗（公开仓库 #36）。截图读的是原始字节，看不出这一处。
  // 视图按源贴图缓存 4 张、换掉最久没用的：呈现走自己的队列，不能挂主提交的延迟释放；同时在跑的呈现最多 3 帧，被换掉的那张已经用完
-@@ -5959,7 +5992,7 @@ static int present_encode_m4(CBUF cb, id<MTLTexture> src0, id<MTLTexture> dst, c
+@@ -5959,7 +6003,7 @@ static int present_encode_m4(CBUF cb, id<MTLTexture> src0, id<MTLTexture> dst, c
          }
          cx = crop[0]; cy = crop[1]; cw = crop[2]; ch = crop[3];
      }
@@ -74,7 +85,7 @@ index a532be8..1281e2d 100644
      double dw = dst.width, dh = dst.height, s = fmin(dw / cw, dh / ch);
      MTLViewport vp = {floor((dw - cw * s) / 2), floor((dh - ch * s) / 2), round(cw * s), round(ch * s), 0, 1};
      if (fabs((dw / dh) / ((double)cw / ch) - 1) < 0.01) vp = (MTLViewport){0, 0, dw, dh, 0, 1};
-@@ -5988,11 +6021,19 @@ static int present_encode_m4(CBUF cb, id<MTLTexture> src0, id<MTLTexture> dst, c
+@@ -5988,11 +6032,19 @@ static int present_encode_m4(CBUF cb, id<MTLTexture> src0, id<MTLTexture> dst, c
  #else
      [g_present_args setAddress:g_present_uv[uv_i].gpuAddress atIndex:0];
  #endif
@@ -95,13 +106,13 @@ index a532be8..1281e2d 100644
  static double g_link_it_tin;   // 节拍回调正在上屏的那一帧的入队时刻（只在节拍线程读写） | Enqueue time of the frame the display-link callback is presenting (read and written only on the display-link thread)
  static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t ticket, const int crop[4], id<CAMetalDrawable> supplied, double target_ts) {
      if (g_present_stall_ns) { struct timespec ts = {0, (long)g_present_stall_ns}; nanosleep(&ts, NULL); }
-@@ -6066,15 +6107,19 @@ static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t t
+@@ -6066,15 +6118,19 @@ static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t t
          while (g_pq_done < g_present_alloc_fence[alloc_i]) pthread_cond_wait(&g_pq_cv, &g_pq_mu);
          pthread_mutex_unlock(&g_pq_mu);
      }
-+    // HDR 调试：自定义页打开 hdr_dbg 且本帧拷到了色调映射前的 HDR 缓冲 → 出图直接显示 HDR（跳过游戏的 SDR 管线：色调映射/FXAA/锐化/UI 都不显示，只为验证 HDR 链路）
++    // HDR 调试：Documents 里有 hdr_dbg 文件且本帧拷到了色调映射前的 HDR 缓冲 → 出图直接显示 HDR（跳过游戏的 SDR 管线：色调映射/FXAA/锐化/UI 都不显示，只为验证 HDR 链路）
 +    // HDR debug: when hdr_dbg is on in the Custom page and this frame's pre-tonemap HDR buffer was captured → present the HDR directly (bypassing the game's SDR pipeline: no tone mapping / FXAA / sharpen / UI, purely to verify the HDR path)
-+    int hdr_dbg = dm_hdr_dbg() && g_hdr_dbg_tex != nil;
++    int hdr_dbg = hdr_dbg_on() && g_hdr_dbg_tex != nil;
 +    id<MTLTexture> psrc = hdr_dbg ? g_hdr_dbg_tex : src;
  #if DM_NVN_M3
      CBUF cb = [g_q commandBuffer];   // 老接口：交画面记在命令缓冲上（presentDrawable），这一帧的绘制做完才上屏 | older API: presentation is recorded on the command buffer (presentDrawable), so the frame reaches the screen only after its drawing is done
@@ -117,54 +128,6 @@ index a532be8..1281e2d 100644
      [cb endCommandBuffer];
  #endif
  #if !DM_NVN_M3
-diff --git a/dm/host/dm_custom.c b/dm/host/dm_custom.c
-index b1c76b1..9948aaf 100644
---- a/dm/host/dm_custom.c
-+++ b/dm/host/dm_custom.c
-@@ -20,9 +20,9 @@
- #include <stdio.h>
- #include <string.h>
- 
--static const char *const k_keys[] = { "lang_en", "auto_mana", "merc_pot", "drop_light", "map_mark", "item_notes", "icloud", "pot_pick", "drop_haptic", "gem_pick", "store_btn", "eco_fps", "q3d", "loot_filter", "auto_buff" };   // 顺序 = 自定义页从上到下的行序（touch_layout.py _CUSTOM_ROWS）：手柄在这页按这个顺序上下选行 | Order = row order of the Custom page from top to bottom (touch_layout.py _CUSTOM_ROWS): the controller selects rows up/down on this page in this order
-+static const char *const k_keys[] = { "lang_en", "auto_mana", "merc_pot", "drop_light", "map_mark", "item_notes", "icloud", "pot_pick", "drop_haptic", "gem_pick", "store_btn", "eco_fps", "q3d", "loot_filter", "auto_buff", "hdr_dbg" };   // 顺序 = 自定义页从上到下的行序（touch_layout.py _CUSTOM_ROWS）：手柄在这页按这个顺序上下选行 | Order = row order of the Custom page from top to bottom (touch_layout.py _CUSTOM_ROWS): the controller selects rows up/down on this page in this order
- #define NK (int)(sizeof k_keys / sizeof *k_keys)
--static const int k_def[NK] = { 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 1, 1 };   // 缺省值：省电模式（30 帧）缺省关、3D 画质缺省流畅优先（q3d=0），其余缺省开 | Defaults: power-saving mode (30 fps) off, 3D quality smoothness first (q3d=0), everything else on
-+static const int k_def[NK] = { 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 1, 1, 0 };   // 缺省值：省电模式（30 帧）缺省关、3D 画质缺省流畅优先（q3d=0）、HDR 调试缺省关，其余缺省开 | Defaults: power-saving mode (30 fps) off, 3D quality smoothness first (q3d=0), HDR debug off, everything else on
- // q3d（3D 画质）：0 = 流畅优先（掉帧就自动降 3D 比例）、1 = 画质优先（不自动降）。生效 = 调 hle_oe.c 的 dm_3d_quality_mode_set，读盘与点「应用」时当场调，下一帧控制器就按新档走。
- // 页上是上下两项单选（同语言行）：TouchCustom_q3d 是「画质优先」那格（勾上 = 1），TouchCustom_q3d_smooth 是它的反面
- // q3d (3D quality): 0 = smoothness first (automatically lowers the 3D scale on frame drops), 1 = quality first (no automatic lowering). Applied by calling hle_oe.c's dm_3d_quality_mode_set, immediately on load and on tapping "Apply", so the controller follows the new setting from the next frame.
-@@ -80,6 +80,7 @@ int dm_custom_get(const char *key) {
- }
- int dm_custom_lang_explicit(void) { load_once(); return atomic_load(&g_loaded) ? atomic_load(&g_lang_explicit) : -1; }
- int dm_fps_setting(void) { return dm_custom_get("eco_fps") ? 30 : 60; }   // 图形层 nvn_mtl.m mtl_fps_target 每帧读（弱符号的强定义） | Read every frame by mtl_fps_target in the graphics layer nvn_mtl.m (strong definition of a weak symbol)
-+int dm_hdr_dbg(void) { return dm_custom_get("hdr_dbg") == 1; }   // HDR 调试：出图直接显示色调映射前的 HDR 缓冲（图形层 nvn_mtl.m 读，弱符号的强定义） | HDR debug: present the pre-tonemap HDR buffer directly (read by the graphics layer nvn_mtl.m; strong definition of a weak symbol)
- static void save(void) {
-     char p[1100], t[1120]; if (!file_path(p, sizeof p)) { LOG("【红】自定义设置：存档目录没挂上，没存盘"); return; }
-     snprintf(t, sizeof t, "%s.tmp", p); FILE *f = fopen(t, "w"); int ok = f != NULL;
-diff --git a/dm/host/dm_custom.h b/dm/host/dm_custom.h
-index ade83b5..b4ed6db 100644
---- a/dm/host/dm_custom.h
-+++ b/dm/host/dm_custom.h
-@@ -13,6 +13,7 @@ int dm_custom_lang_explicit(void);   // 语言开关（键 lang_en）在设置
- // q3d 3D 画质（缺省 0 = 流畅优先：掉帧自动降 3D 比例；1 = 画质优先：不自动降），读盘 / 应用时调 hle_oe.c 的 dm_3d_quality_mode_set 生效
- // q3d 3D quality (default 0 = smoothness first: automatically lowers the 3D scale on frame drops; 1 = quality first: no automatic lowering); applied on load / apply by calling hle_oe.c's dm_3d_quality_mode_set
- int dm_fps_setting(void);   // 省电模式（键 eco_fps，缺省关）：开 = 30 帧、关 = 60；nvn_mtl.m mtl_fps_target 读 | Power-saving mode (key eco_fps, off by default): on = 30 fps, off = 60; read by mtl_fps_target in nvn_mtl.m
-+int dm_hdr_dbg(void);   // HDR 调试（键 hdr_dbg，缺省关）：开 = 出图直接显示色调映射前的 HDR 缓冲；nvn_mtl.m 出图与拷贝点读 | HDR debug (key hdr_dbg, off by default): on = present the pre-tonemap HDR buffer directly; read by the present path and the capture point in nvn_mtl.m
- 
- void dm_custom_init(const char *dir);   // 设置文件所在目录（iOS 外壳启动时给 Documents）；不调则用存档提交目录的上一级（Mac 宿主） | Directory holding the settings file (the iOS shell passes Documents at startup); if not called, the parent of the save commit directory is used (Mac host)
- 
-diff --git a/dm/i18n/ui_text.tsv b/dm/i18n/ui_text.tsv
-index bacd9f5..44a057b 100644
---- a/dm/i18n/ui_text.tsv
-+++ b/dm/i18n/ui_text.tsv
-@@ -81,6 +81,7 @@ dmCustomQ3dQuality	画质优先	Quality first	自定义页「3D 画质」单选
- dmCustomQ3dQualityHint	始终保持设定的 3D 清晰度	Always keeps the set 3D resolution	画质优先下面的说明小字
- dmCustomLootFilter	掉落过滤（噩梦起自动隐藏杂物）	Loot Filter (auto, Nightmare+)	自定义页开关；Loot Filter 是原版过滤器的英文名
- dmCustomAutoBuff	自动补上增益技能（站着不动时）	Auto-recast buffs when idle	自定义页开关
-+dmCustomHdrDbg	HDR 调试：直接显示 HDR 缓冲	HDR debug: show HDR buffer	自定义页开关
- dmCustomLang	语言 / Language	语言 / Language	自定义页语言那一行的标签。两种界面写同样的中英两个词：这一行的文字控件指定原版的全球字体 BlizzardGlobal（英文界面缺省的 Formal 字体没有汉字，全球字体有；原版标题页、队伍名、合规提示同样按控件指定它）
- dmCustomLangZh	中文	中文	语言行的选项一（两种界面都写「中文」，同上用全球字体）
- dmCustomLangEnOpt	English	English	语言行的选项二
 diff --git a/dm/ios/Sources/front_ios.m b/dm/ios/Sources/front_ios.m
 index 5ed1c67..d1e1e08 100644
 --- a/dm/ios/Sources/front_ios.m
@@ -194,16 +157,3 @@ index 5ed1c67..d1e1e08 100644
          _q = [l.device newCommandQueue];
          _dl = [CADisplayLink displayLinkWithTarget:self selector:@selector(tick)]; _dl.preferredFrameRateRange = CAFrameRateRangeMake(60, 60, 60);
          [_dl addToRunLoop:NSRunLoop.mainRunLoop forMode:NSRunLoopCommonModes];
-diff --git a/dm/ios/tools/touch_layout.py b/dm/ios/tools/touch_layout.py
-index cfbe856..6dad0c3 100644
---- a/dm/ios/tools/touch_layout.py
-+++ b/dm/ios/tools/touch_layout.py
-@@ -1175,7 +1175,7 @@ def _drop_rows(*rows):
- # (console version VideoOptionsPanelHD.json; the touch version has already removed the video tab): the fourth item of the tab strip (originally 「控制」(Controls) = KeyBindingMenu, which does not appear on this platform) is renamed 「自定义」(Custom) and opens VideoOptionsPanel;
- # the video page's table is replaced entirely with our rows: section header + one original-game checkbox per switch (following the fields of the 「自动拾取金币」(Auto Gold Pickup) row on the 「游戏」(Game) page). Widget names are TouchCustom_<key>,
- # and the host dm_custom.c reads whether each is checked and handles apply / discard / default. The checkbox message sends a harmless ClosePanel (same as 「极乐世界」(Elysium)), which the game does not recognize
--_CUSTOM_KEYS = ('auto_mana', 'merc_pot', 'drop_light', 'map_mark', 'item_notes', 'icloud', 'pot_pick', 'drop_haptic', 'gem_pick', 'store_btn', 'eco_fps', 'q3d', 'loot_filter', 'auto_buff')
-+_CUSTOM_KEYS = ('auto_mana', 'merc_pot', 'drop_light', 'map_mark', 'item_notes', 'icloud', 'pot_pick', 'drop_haptic', 'gem_pick', 'store_btn', 'eco_fps', 'q3d', 'loot_filter', 'auto_buff', 'hdr_dbg')
- # 字在中英表（dm/i18n/ui_text.tsv 的 dmCustom<键名驼峰>），布局写 @键、跟原版语言走（英文版）；行高按中文行数分，英文必须同样行数（不然换语言排版变）
- # The text lives in the Chinese-English string table (dmCustom<key name in camel case> in dm/i18n/ui_text.tsv); layouts write @key and follow the
- # original game's language (English version); row height is assigned by the number of Chinese lines, and English must have the same number of lines
